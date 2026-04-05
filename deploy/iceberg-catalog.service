@@ -16,8 +16,9 @@ EnvironmentFile=/etc/iceberg-catalog.env
 ExecStartPre=-/usr/bin/docker rm -f iceberg-rest
 ExecStartPre=-/usr/bin/docker pull ${ICEBERG_REST_IMAGE}
 ExecStart=/usr/bin/docker run --rm --name iceberg-rest \
+  --user 0:0 \
   --env-file /etc/iceberg-catalog.env \
-  -v /var/lib/iceberg-catalog:/data \
+  -v /var/lib/iceberg-catalog:/data:z \
   -p 127.0.0.1:8085:9000 \
   ${ICEBERG_REST_IMAGE}
 

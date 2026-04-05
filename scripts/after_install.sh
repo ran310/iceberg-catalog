@@ -1,7 +1,9 @@
 #!/bin/bash
 set -euxo pipefail
 install -d -m 755 /opt/iceberg-catalog
-install -d -m 700 /var/lib/iceberg-catalog
+# SQLite catalog.db lives here (bind-mounted as /data in the container). Mode 700 + non-root
+# container user causes SQLITE_CANTOPEN; 755 + root-run container (:z for SELinux) fixes AL2023.
+install -d -m 755 /var/lib/iceberg-catalog
 
 # Env: if the bundle ships deploy/iceberg-catalog.env, always refresh /etc (CI/CD friendly).
 # Otherwise seed /etc once from example so the unit can start without SSH on first deploy.

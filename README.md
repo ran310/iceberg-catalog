@@ -33,6 +33,22 @@ Optional variables: `AWS_REGION`, `AWS_EC2_STACK_NAME` (default `AwsInfra-Ec2Ngi
 
 CodeDeploy **`ApplicationStart`** runs `systemctl start iceberg-catalog.service`. The unit is **enabled**, so it also starts after reboot. **`after_install`** refreshes `/etc/iceberg-catalog.env` from the bundle when `deploy/iceberg-catalog.env` is present, installs `/etc/nginx/.htpasswd-iceberg-catalog` from `deploy/iceberg-catalog.htpasswd`, and **`nginx -t && systemctl reload nginx`**.
 
+### Troubleshooting: `SQLITE_CANTOPEN` / connection refused on 8085
+
+The container writes SQLite to **`/data/catalog.db`**, which is the host directory **`/var/lib/iceberg-catalog`**. If the JVM runs as a non-root user and that directory was **`chmod 700` root-only**, or **SELinux** blocks the bind mount on Amazon Linux, SQLite fails with **`unable to open database file`**.
+
+The bundled **`iceberg-catalog.service`** runs the container as **`root`** (`--user 0:0`) and mounts with **`:z`** so Docker can relabel the volume for SELinux. After pulling that change, redeploy or on the instance run:
+
+```bash
+sudo chmod 755 /var/lib/iceberg-catalog
+sudo systemctl daemon-reload
+sudo systemctl restart iceberg-catalog.service
+curl -fsS http://127.0.0.1:8085/v1/config | head
+```
+
+To see which UID the image uses without `--user 0:0`:  
+`docker run --rm --entrypoint id tabulario/iceberg-rest:1.6.0`
+
 ## Manual deploy (optional)
 
 If you need a local deploy without GitHub:
