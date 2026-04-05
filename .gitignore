@@ -1,0 +1,5 @@
+.local/
+deploy/iceberg-catalog.env
+deploy/iceberg-catalog.htpasswd
+*.zip
+.DS_Store

@@ -1,0 +1,184 @@
+name: Deploy to AWS
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+
+permissions:
+  id-token: write
+  contents: read
+
+env:
+  AWS_REGION: ${{ vars.AWS_REGION || 'us-east-1' }}
+  EC2_STACK_NAME: ${{ vars.AWS_EC2_STACK_NAME || 'AwsInfra-Ec2Nginx' }}
+
+# Repository secrets (Settings → Secrets and variables → Actions):
+#   AWS_ROLE_TO_ASSUME          — IAM role ARN from AwsInfra-GitHubOidc output GitHubActionsRoleArn
+#   ICEBERG_CATALOG_HTPASSWD    — full htpasswd file body (see README); never commit this
+#
+# Repository variables (optional overrides):
+#   AWS_REGION, AWS_EC2_STACK_NAME, CATALOG_WAREHOUSE (must match lake bucket / prefix)
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_TO_ASSUME }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Resolve stack outputs
+        id: stack
+        run: |
+          BUCKET=$(aws cloudformation describe-stacks \
+            --stack-name "${EC2_STACK_NAME}" \
+            --query "Stacks[0].Outputs[?OutputKey=='Ec2NginxArtifactBucketName'].OutputValue" \
+            --output text)
+          APP=$(aws cloudformation describe-stacks \
+            --stack-name "${EC2_STACK_NAME}" \
+            --query "Stacks[0].Outputs[?OutputKey=='CodeDeployAppName'].OutputValue" \
+            --output text)
+          DG=$(aws cloudformation describe-stacks \
+            --stack-name "${EC2_STACK_NAME}" \
+            --query "Stacks[0].Outputs[?OutputKey=='CodeDeployDeploymentGroupNameIcebergCatalog'].OutputValue" \
+            --output text)
+          echo "bucket=${BUCKET}" >> "$GITHUB_OUTPUT"
+          echo "app=${APP}" >> "$GITHUB_OUTPUT"
+          echo "dg=${DG}" >> "$GITHUB_OUTPUT"
+
+      - name: Write deploy/iceberg-catalog.env
+        env:
+          CATALOG_WAREHOUSE: ${{ vars.CATALOG_WAREHOUSE }}
+          OUT_REGION: ${{ env.AWS_REGION }}
+        run: |
+          set -euo pipefail
+          if [[ -z "${CATALOG_WAREHOUSE:-}" ]]; then
+            echo "Set repository variable CATALOG_WAREHOUSE (e.g. s3://mylakehouse-ACCOUNT-us-east-1/warehouse/)." >&2
+            exit 1
+          fi
+          python3 <<'PY'
+          import os
+          wh = os.environ["CATALOG_WAREHOUSE"]
+          region = os.environ["OUT_REGION"]
+          out_lines = []
+          with open("deploy/iceberg-catalog.env.example") as f:
+              for line in f:
+                  s = line.rstrip("\n")
+                  if s.startswith("CATALOG_WAREHOUSE="):
+                      out_lines.append(f"CATALOG_WAREHOUSE={wh}")
+                  elif s.startswith("AWS_REGION="):
+                      out_lines.append(f"AWS_REGION={region}")
+                  else:
+                      out_lines.append(s)
+          with open("deploy/iceberg-catalog.env", "w") as out:
+              out.write("\n".join(out_lines) + "\n")
+          PY
+
+      - name: Write nginx htpasswd for CodeDeploy bundle
+        env:
+          HTPASSWD_BODY: ${{ secrets.ICEBERG_CATALOG_HTPASSWD }}
+        run: |
+          set -euo pipefail
+          if [[ -z "${HTPASSWD_BODY}" ]]; then
+            echo "Set repository secret ICEBERG_CATALOG_HTPASSWD to the htpasswd file contents." >&2
+            exit 1
+          fi
+          printf '%s\n' "${HTPASSWD_BODY}" > deploy/iceberg-catalog.htpasswd
+          chmod 600 deploy/iceberg-catalog.htpasswd
+
+      - name: Make hook scripts executable
+        run: chmod +x scripts/*.sh
+
+      - name: Create deployment bundle (zip)
+        run: |
+          set -euo pipefail
+          zip -qr /tmp/iceberg-catalog-bundle.zip appspec.yml deploy scripts
+          du -sh /tmp/iceberg-catalog-bundle.zip
+
+      - name: Upload bundle to S3
+        id: upload
+        env:
+          BUCKET: ${{ steps.stack.outputs.bucket }}
+        run: |
+          KEY="iceberg-catalog/releases/${GITHUB_SHA}.zip"
+          aws s3 cp /tmp/iceberg-catalog-bundle.zip "s3://${BUCKET}/${KEY}"
+          echo "key=${KEY}" >> "$GITHUB_OUTPUT"
+
+      - name: Wait until CodeDeploy deployment group is idle
+        env:
+          APP: ${{ steps.stack.outputs.app }}
+          DG: ${{ steps.stack.outputs.dg }}
+        run: |
+          set -euo pipefail
+          deadline=$((SECONDS + 3600))
+          while (( SECONDS < deadline )); do
+            if ! ids=$(aws deploy list-deployments \
+              --application-name "${APP}" \
+              --deployment-group-name "${DG}" \
+              --include-only-statuses Created Queued InProgress Ready \
+              --query 'deployments' \
+              --output text 2>cd-list.err); then
+              echo "list-deployments failed; retrying in 20s…"
+              sed 's/^/  /' cd-list.err >&2 || true
+              sleep 20
+              continue
+            fi
+            rm -f cd-list.err
+            if [[ -z "${ids}" || "${ids}" == "None" ]]; then
+              echo "CodeDeploy deployment group is idle."
+              exit 0
+            fi
+            echo "Active deployment ID(s): ${ids} — waiting 20s…"
+            sleep 20
+          done
+          echo "Timed out waiting for idle deployment group." >&2
+          exit 1
+
+      - name: Create CodeDeploy deployment
+        id: deploy
+        env:
+          BUCKET: ${{ steps.stack.outputs.bucket }}
+          S3_KEY: ${{ steps.upload.outputs.key }}
+          APP: ${{ steps.stack.outputs.app }}
+          DG: ${{ steps.stack.outputs.dg }}
+        run: |
+          set -euo pipefail
+          DEPLOYMENT_ID=""
+          for attempt in $(seq 1 30); do
+            if DEPLOYMENT_ID=$(aws deploy create-deployment \
+              --application-name "${APP}" \
+              --deployment-group-name "${DG}" \
+              --s3-location "bucket=${BUCKET},key=${S3_KEY},bundleType=zip" \
+              --description "iceberg-catalog sha=${GITHUB_SHA} ref=${GITHUB_REF_NAME}" \
+              --query 'deploymentId' \
+              --output text 2>cd.err); then
+              rm -f cd.err
+              break
+            fi
+            if grep -qF 'DeploymentLimitExceeded' cd.err 2>/dev/null; then
+              echo "DeploymentLimitExceeded; retry ${attempt}/30 in 25s…"
+              sleep 25
+              continue
+            fi
+            cat cd.err >&2
+            exit 1
+          done
+          if [[ -z "${DEPLOYMENT_ID}" || "${DEPLOYMENT_ID}" == "None" ]]; then
+            echo "Failed to create deployment." >&2
+            exit 1
+          fi
+          echo "deployment_id=${DEPLOYMENT_ID}" >> "$GITHUB_OUTPUT"
+          echo "Created deployment: ${DEPLOYMENT_ID}"
+
+      - name: Wait for deployment to succeed
+        env:
+          DEPLOYMENT_ID: ${{ steps.deploy.outputs.deployment_id }}
+        run: |
+          echo "Waiting for ${DEPLOYMENT_ID}…"
+          aws deploy wait deployment-successful --deployment-id "${DEPLOYMENT_ID}"
+          echo "Deployment succeeded."

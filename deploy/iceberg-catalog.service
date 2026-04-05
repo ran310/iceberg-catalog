@@ -1,0 +1,27 @@
+[Unit]
+Description=Apache Iceberg REST catalog (JdbcCatalog + S3 warehouse)
+After=docker.service network-online.target
+Wants=network-online.target
+Requires=docker.service
+
+[Service]
+Type=simple
+Restart=on-failure
+RestartSec=15
+Environment=ICEBERG_REST_IMAGE=tabulario/iceberg-rest:1.6.0
+
+# Secrets and bucket name — installed by CodeDeploy from deploy/iceberg-catalog.env
+EnvironmentFile=/etc/iceberg-catalog.env
+
+ExecStartPre=-/usr/bin/docker rm -f iceberg-rest
+ExecStartPre=-/usr/bin/docker pull ${ICEBERG_REST_IMAGE}
+ExecStart=/usr/bin/docker run --rm --name iceberg-rest \
+  --env-file /etc/iceberg-catalog.env \
+  -v /var/lib/iceberg-catalog:/data \
+  -p 127.0.0.1:8085:9000 \
+  ${ICEBERG_REST_IMAGE}
+
+ExecStop=/usr/bin/docker stop -t 30 iceberg-rest
+
+[Install]
+WantedBy=multi-user.target
